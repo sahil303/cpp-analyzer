@@ -73,15 +73,20 @@ def _parse_lizard(csv_path: str, metrics: dict):
     if not csv_path or not os.path.exists(csv_path):
         return
 
+    # Lizard CSV has NO header row. Positional columns:
+    # 0:NLOC  1:CCN  2:token  3:PARAM  4:length
+    # 5:location  6:filepath  7:func_name  8:func_sig  9:start  10:end
     with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.reader(f)
         for row in reader:
             try:
-                filename = row.get("filename") or row.get("file_name") or ""
-                func_name = row.get("name") or row.get("function_name") or "unknown"
-                ccn = int(row.get("cyclomatic_complexity") or row.get("CCN") or 0)
-                length = int(row.get("nloc") or row.get("length") or 0)
-                params = int(row.get("parameter_count") or row.get("args") or 0)
+                if len(row) < 8:
+                    continue
+                length    = int(float(row[0]))
+                ccn       = int(float(row[1]))
+                params    = int(float(row[3]))
+                filename  = row[6].strip()
+                func_name = row[7].strip()
 
                 short_name = _shorten_path(filename)
 

@@ -1,0 +1,14 @@
+# Ignore generated report and analysis output
+output/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.env
+
+# System files
+.DS_Store
+Thumbs.db

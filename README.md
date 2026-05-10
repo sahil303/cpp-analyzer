@@ -1,7 +1,7 @@
 # cpp_analyzer — C++ OO Analysis Tool
 
 Automated C++ code smell detection, OO principle violation mapping,
-and AI-powered refactoring suggestions. Outputs a PDF report.
+and AI-powered comprehensive reports with refactoring suggestions. Outputs a PDF report.
 
 ## Quick Start
 
@@ -22,8 +22,9 @@ winget install Cppcheck.Cppcheck
 winget install LLVM.LLVM
 ```
 
-### 3. Get a free Groq API key
-Sign up at https://console.groq.com (free, no credit card needed)
+### 3. Get an AI API key (optional)
+- **Groq** (default): Sign up at https://console.groq.com (free, no credit card needed)
+- **Gemini**: Get API key from https://makersuite.google.com/app/apikey
 
 ### 4. Run the analyzer
 
@@ -37,15 +38,21 @@ python analyze.py --repo C:\path\to\your\cpp\project --output ./output
 python analyze.py --repo https://github.com/owner/repo --output ./output
 ```
 
-**With AI suggestions:**
+**With AI-powered comprehensive analysis (Groq):**
 ```bash
-set GROQ_API_KEY=your_key_here
+set AI_API_KEY=your_groq_key_here
 python analyze.py --repo C:\path\to\project --output ./output
+```
+
+**With AI-powered comprehensive analysis (Gemini):**
+```bash
+set AI_API_KEY=your_gemini_key_here
+python analyze.py --repo C:\path\to\project --ai-model gemini --output ./output
 ```
 
 Or pass it inline:
 ```bash
-python analyze.py --repo C:\path\to\project --groq-key YOUR_KEY --output ./output
+python analyze.py --repo C:\path\to\project --ai-key YOUR_KEY --ai-model groq --output ./output
 ```
 
 ## Output
@@ -77,6 +84,6 @@ cpp_analyzer/
     ├── setup.py        ← Repo cloning & tool checks
     ├── analysis.py     ← Runs cppcheck, lizard, clang-tidy
     ├── metrics.py      ← Parses outputs, detects smells
-    ├── ai_agent.py     ← Groq AI refactoring suggestions
+    ├── ai_agent.py     ← AI-powered analysis and refactoring suggestions (Groq/Gemini)
     └── report.py       ← PDF report generation
 ```

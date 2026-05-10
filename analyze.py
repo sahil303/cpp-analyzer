@@ -34,18 +34,24 @@ def main():
         help="Project name (used in report). Auto-detected if not given."
     )
     parser.add_argument(
-        "--groq-key",
+        "--ai-model",
+        default="groq",
+        choices=["groq", "gemini"],
+        help="AI model to use for suggestions (default: groq)"
+    )
+    parser.add_argument(
+        "--ai-key",
         default=None,
-        help="Groq API key. Can also be set via GROQ_API_KEY env variable."
+        help="AI API key. Can also be set via AI_API_KEY env variable."
     )
 
     args = parser.parse_args()
 
-    # Resolve Groq API key
-    groq_key = args.groq_key or os.environ.get("GROQ_API_KEY")
-    if not groq_key:
-        print("[WARNING] No Groq API key provided. AI suggestions will be skipped.")
-        print("          Set via --groq-key or GROQ_API_KEY environment variable.\n")
+    # Resolve AI API key
+    ai_key = args.ai_key or os.environ.get("AI_API_KEY")
+    if not ai_key:
+        print(f"[WARNING] No {args.ai_model.upper()} API key provided. AI suggestions will be skipped.")
+        print(f"          Set via --ai-key or AI_API_KEY environment variable.\n")
 
     print("=" * 60)
     print("  C++ OO Analyzer — Dissertation Analysis Tool")
@@ -73,9 +79,9 @@ def main():
 
     # Step 4: AI refactoring suggestions
     suggestions = {}
-    if groq_key:
-        print("\n[4/5] Getting AI refactoring suggestions via Groq...")
-        suggestions = get_refactoring_suggestions(metrics, groq_key)
+    if ai_key:
+        print(f"\n[4/5] Getting AI refactoring suggestions via {args.ai_model.upper()}...")
+        suggestions = get_refactoring_suggestions(metrics, args.ai_model, ai_key)
         print(f"      Suggestions generated for {len(suggestions)} files.")
     else:
         print("\n[4/5] Skipping AI suggestions (no API key).")

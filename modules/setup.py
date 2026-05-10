@@ -25,7 +25,9 @@ def setup_repo(repo_input: str, output_dir: str) -> tuple[str, str]:
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "raw"), exist_ok=True)
 
-    _check_and_install_tools()
+    if not _check_and_install_tools():
+        print("  [ERROR] Required tools are missing. Aborting.")
+        sys.exit(1)
 
     if repo_input.startswith("http://") or repo_input.startswith("https://"):
         return _clone_repo(repo_input, output_dir)
@@ -35,27 +37,43 @@ def setup_repo(repo_input: str, output_dir: str) -> tuple[str, str]:
 
 # ─── Tool Installation ────────────────────────────────────────────────────────
 
-def _check_and_install_tools():
+def _check_and_install_tools() -> bool:
     """Check each required tool; install if missing (Windows-friendly)."""
     print("\n  Checking required tools...")
+
+    all_tools_ready = True
 
     # lizard via pip (cross-platform)
     if not shutil.which("lizard"):
         print("    [+] Installing lizard via pip...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "lizard", "-q"],
-            check=True
-        )
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "lizard", "-q"],
+                check=True
+            )
+        except subprocess.CalledProcessError:
+            print("    [ERROR] Failed to install lizard via pip.")
+            all_tools_ready = False
+        else:
+            if not shutil.which("lizard"):
+                all_tools_ready = False
 
     # cppcheck
     if not shutil.which("cppcheck"):
         _install_cppcheck()
+        all_tools_ready = False
 
     # clang-tidy
     if not shutil.which("clang-tidy"):
         _install_clang_tidy()
+        all_tools_ready = False
 
-    print("  All tools ready.\n")
+    if all_tools_ready:
+        print("  All tools ready.\n")
+    else:
+        print("  Some tools are missing or unavailable.\n")
+
+    return all_tools_ready
 
 
 def _install_cppcheck():
