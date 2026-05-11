@@ -238,131 +238,246 @@ def _ai_suggestions_section(suggestions: dict, styles: dict) -> list:
 
     for filename, suggestion in suggestions.items():
         story.append(Paragraph(f"File: {filename}", styles["subheading"]))
-        normalized = _normalize_markdown(suggestion)
-        story.extend(_markdown_to_flowables(normalized, styles))
+        story.extend(_markdown_to_flowables(suggestion, styles))
         story.append(Spacer(1, 0.4*cm))
 
     return story
 
 
-def _normalize_markdown(markdown_text: str) -> str:
-    lines = []
-    prev_blank = True
-
-    for raw_line in markdown_text.splitlines():
-        line = raw_line.rstrip()
-        if not line:
-            lines.append("")
-            prev_blank = True
-            continue
-
-        if re.match(r"^(#{1,6})\s+", line) and not prev_blank:
-            lines.append("")
-
-        if re.match(r"^(?:\*|\-|\+|\d+\.)\s+", line) and not prev_blank:
-            lines.append("")
-
-        if line.strip() == "---" and not prev_blank:
-            lines.append("")
-
-        lines.append(line)
-        prev_blank = False
-
-    normalized = "\n".join(lines)
-    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-
-    normalized = re.sub(
-        r"([^.\n])\s*(\d+\.\s+(?:Problem Summary|Violated OO Principles|Root Cause Analysis|Refactoring Strategy|Step-by-Step Refactoring Plan|Expected Benefits|Potential Risks))",
-        r"\1\n\n\2",
-        normalized,
-    )
-    normalized = re.sub(        r"([^\.\n])\s*(#{1,6}\s+)",
-        r"\1\n\n\2",
-        normalized,
-    )
-    normalized = re.sub(        r"([^.\n])\s*(\*\s+|\-\s+|\+\s+|\d+\.\s+)",
-        r"\1\n\n\2",
-        normalized,
-    )
-    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-    return normalized
-
-    normalized = "\n".join(lines)
-    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-    return normalized
+def _md_inline(text: str) -> str:
+    """Convert inline markdown (**bold**, *italic*, `code`) to ReportLab XML tags."""
+    # Escape existing XML special chars first (except & already escaped)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Bold+italic ***text***
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'<b><i>\1</i></b>', text)
+    # Bold **text**
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    # Italic *text* (not bullet markers)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+    # Inline code `text`
+    text = re.sub(r'`([^`]+)`', r'<font face="Courier">\1</font>', text)
+    return text
 
 
 def _markdown_to_flowables(markdown_text: str, styles: dict) -> list:
+    """
+    Robustly convert AI markdown response to ReportLab flowables.
+    Handles: ### headings, bullet lists, numbered lists,
+             fenced code blocks, inline bold/italic/code, paragraphs.
+    """
     flowables = []
-    blocks = re.split(r"\n\s*\n", markdown_text.strip())
+    lines     = markdown_text.splitlines()
+    i         = 0
 
-    for block in blocks:
-        block = block.strip()
-        if not block:
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # ── Skip blank lines
+        if not stripped:
+            i += 1
             continue
 
-        if block == "---":
-            flowables.append(Spacer(1, 0.3*cm))
+        # ── Horizontal rule
+        if stripped in ("---", "***", "___"):
+            flowables.append(HRFlowable(width="100%", thickness=0.5, color=LIGHT_GRAY))
+            flowables.append(Spacer(1, 0.1 * cm))
+            i += 1
             continue
 
-        heading_match = re.match(r"^(#{1,6})\s+(.*)", block)
+        # ── Fenced code block  ```...```
+        if stripped.startswith("```"):
+            code_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # skip closing ```
+            code_text = "\n".join(code_lines)
+            # Escape XML in code
+            code_text = (code_text
+                         .replace("&", "&amp;")
+                         .replace("<", "&lt;")
+                         .replace(">", "&gt;"))
+            flowables.append(
+                Paragraph(
+                    f'<font face="Courier" size="7">{code_text}</font>',
+                    styles["code"]
+                )
+            )
+            flowables.append(Spacer(1, 0.15 * cm))
+            continue
+
+        # ── Headings  # / ## / ###
+        heading_match = re.match(r'^(#{1,6})\s+(.*)', stripped)
         if heading_match:
-            heading_text = heading_match.group(2).strip()
-            flowables.append(Paragraph(heading_text, styles["subheading"]))
+            level = len(heading_match.group(1))
+            text  = _md_inline(heading_match.group(2).strip())
+            style = styles["subheading"] if level >= 2 else styles["section_title"]
+            flowables.append(Spacer(1, 0.15 * cm))
+            flowables.append(Paragraph(text, style))
+            flowables.append(Spacer(1, 0.05 * cm))
+            i += 1
             continue
 
-        lines = [line.strip() for line in block.splitlines() if line.strip()]
-        if all(re.match(r"^(?:\*|\-|\+|\d+\.)\s+", line) for line in lines):
-            for line in lines:
-                bullet_text = re.sub(r"^(?:\*|\-|\+|\d+\.)\s+", "", line)
-                flowables.append(Paragraph(f"• {bullet_text}", styles["body_small"]))
+        # ── Bullet list  - / * / +
+        if re.match(r'^[\*\-\+]\s+', stripped):
+            while i < len(lines) and re.match(r'^[\*\-\+]\s+', lines[i].strip()):
+                item = re.sub(r'^[\*\-\+]\s+', '', lines[i].strip())
+                flowables.append(
+                    Paragraph(f"&bull;&nbsp;&nbsp;{_md_inline(item)}", styles["bullet"])
+                )
+                i += 1
+            flowables.append(Spacer(1, 0.05 * cm))
             continue
 
-        code_block = "\n".join(lines)
-        if code_block.startswith("```") and code_block.endswith("```"):
-            code_text = code_block.strip("`")
-            flowables.append(Paragraph(f"<font face='Courier'>{code_text}</font>", styles["code"]))
+        # ── Numbered list  1. / 2. etc.
+        if re.match(r'^\d+\.\s+', stripped):
+            num = 1
+            while i < len(lines) and re.match(r'^\d+\.\s+', lines[i].strip()):
+                item = re.sub(r'^\d+\.\s+', '', lines[i].strip())
+                flowables.append(
+                    Paragraph(f"<b>{num}.</b>&nbsp;&nbsp;{_md_inline(item)}", styles["numbered"])
+                )
+                num += 1
+                i += 1
+            flowables.append(Spacer(1, 0.05 * cm))
             continue
 
-        paragraph = " ".join(lines)
-        paragraph = re.sub(r"\s+", " ", paragraph)
-        flowables.append(Paragraph(paragraph, styles["body_small"]))
+        # ── Regular paragraph (collect consecutive non-special lines)
+        para_lines = []
+        while i < len(lines):
+            l = lines[i].strip()
+            if (not l or
+                l.startswith("#") or
+                l.startswith("```") or
+                re.match(r'^[\*\-\+]\s+', l) or
+                re.match(r'^\d+\.\s+', l) or
+                l in ("---", "***", "___")):
+                break
+            para_lines.append(l)
+            i += 1
+
+        text = " ".join(para_lines).strip()
+        if text:
+            flowables.append(Paragraph(_md_inline(text), styles["body_small"]))
+            flowables.append(Spacer(1, 0.08 * cm))
 
     return flowables
 
 
 def _appendix_section(metrics: dict, styles: dict) -> list:
-    files = metrics.get("files", {})
+    files      = metrics.get("files", {})
+    ck_metrics = metrics.get("ck_metrics", {})
+    avgs       = metrics.get("summary", {}).get("ck_averages", {})
 
     story = [
-        Paragraph("Appendix: File Metrics", styles["section_title"]),
+        Paragraph("Appendix A: Full CK Metrics per File", styles["section_title"]),
         HRFlowable(width="100%", thickness=1, color=MID_BLUE),
-        Spacer(1, 0.3*cm),
+        Spacer(1, 0.2*cm),
+        Paragraph(
+            "The Chidamber &amp; Kemerer (CK) metric suite provides quantitative indicators "
+            "of object-oriented design quality. Values above threshold indicate design issues "
+            "mapped to SOLID principle violations.",
+            styles["body"]
+        ),
+        Spacer(1, 0.2*cm),
     ]
 
-    table_data = [["File", "Total Lines", "Functions", "Max CCN"]]
-    for filename, data in sorted(files.items()):
+    # CK Averages summary row
+    avg_table = [
+        ["Metric", "Avg Value", "Description", "Threshold (High)", "SOLID Principle"],
+        ["WMC",  str(avgs.get("avg_WMC", 0)),  "Weighted Methods per Class",  "> 20",   "S — SRP"],
+        ["CBO",  str(avgs.get("avg_CBO", 0)),  "Coupling Between Objects",    "> 10",   "D — DIP, O — OCP"],
+        ["RFC",  str(avgs.get("avg_RFC", 0)),  "Response for a Class",        "> 50",   "S — SRP, D — DIP"],
+        ["LCOM", str(avgs.get("avg_LCOM", 0)), "Lack of Cohesion in Methods", "> 0.7",  "S — SRP"],
+        ["DIT",  str(avgs.get("avg_DIT", 0)),  "Depth of Inheritance Tree",   "> 3",    "L — LSP"],
+        ["NOC",  str(avgs.get("avg_NOC", 0)),  "Number of Children",          "> 10",   "L — LSP, O — OCP"],
+        ["CCN",  str(avgs.get("avg_CCN_max", 0)), "Max Cyclomatic Complexity","> 10",   "S — SRP, O — OCP"],
+        ["NLOC", str(avgs.get("avg_NLOC", 0)), "Avg Lines of Code per file",  "> 500",  "S — SRP"],
+    ]
+    at = Table(avg_table, colWidths=[1.5*cm, 1.8*cm, 4*cm, 3*cm, 4.2*cm])
+    at.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, 0), DARK_BLUE),
+        ("TEXTCOLOR",     (0, 0), (-1, 0), colors.white),
+        ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 8),
+        ("GRID",          (0, 0), (-1, -1), 0.3, colors.grey),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
+        ("ALIGN",         (1, 0), (1, -1), "CENTER"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(at)
+    story.append(Spacer(1, 0.4*cm))
+
+    # Per-file CK metrics table
+    story.append(Paragraph("Per-File CK Metrics", styles["subheading"]))
+    table_data = [["File", "WMC", "CBO", "RFC", "LCOM", "DIT", "NOC", "CCN", "NLOC"]]
+    for filename in sorted(files.keys()):
+        ck = ck_metrics.get(filename, {})
         table_data.append([
             Paragraph(filename, styles["table_cell_small"]),
-            str(data.get("total_nloc", 0)),
-            str(len(data.get("functions", []))),
-            str(data.get("max_ccn", 0)),
+            str(ck.get("WMC", 0)),
+            str(ck.get("CBO", 0)),
+            str(ck.get("RFC", 0)),
+            str(round(ck.get("LCOM", 0.0), 2)),
+            str(ck.get("DIT", 0)),
+            str(ck.get("NOC", 0)),
+            str(ck.get("CCN_max", 0)),
+            str(ck.get("NLOC_total", 0)),
         ])
 
-    t = Table(table_data, colWidths=[9*cm, 3*cm, 3*cm, 2*cm])
+    col_w = [5*cm, 1.2*cm, 1.2*cm, 1.2*cm, 1.4*cm, 1.2*cm, 1.2*cm, 1.2*cm, 1.4*cm]
+    t = Table(table_data, colWidths=col_w)
     t.setStyle(TableStyle([
         ("BACKGROUND",    (0, 0), (-1, 0), DARK_BLUE),
         ("TEXTCOLOR",     (0, 0), (-1, 0), colors.white),
         ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",      (0, 0), (-1, 0), 9),
-        ("FONTSIZE",      (0, 1), (-1, -1), 8),
+        ("FONTSIZE",      (0, 0), (-1, 0), 8),
+        ("FONTSIZE",      (0, 1), (-1, -1), 7),
         ("GRID",          (0, 0), (-1, -1), 0.3, colors.grey),
         ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
         ("ALIGN",         (1, 0), (-1, -1), "CENTER"),
-        ("TOPPADDING",    (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
     ]))
     story.append(t)
+
+    # SOLID violation summary
+    story.append(Spacer(1, 0.4*cm))
+    story.append(Paragraph("Appendix B: SOLID Principle Violation Summary", styles["section_title"]))
+    story.append(HRFlowable(width="100%", thickness=1, color=MID_BLUE))
+    story.append(Spacer(1, 0.2*cm))
+
+    solid_table = [["SOLID Principle", "Occurrences", "Most Violated By"]]
+    violations = metrics.get("principle_violations", {})
+    for principle, issues in sorted(violations.items(), key=lambda x: -len(x[1])):
+        top_smell = max(set(i["smell"] for i in issues), key=lambda s: sum(1 for i in issues if i["smell"] == s))
+        solid_table.append([
+            Paragraph(principle, styles["table_cell_small"]),
+            str(len(issues)),
+            top_smell.replace("_", " ").title(),
+        ])
+
+    if len(solid_table) > 1:
+        st = Table(solid_table, colWidths=[8*cm, 2.5*cm, 4*cm])
+        st.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, 0), DARK_BLUE),
+            ("TEXTCOLOR",     (0, 0), (-1, 0), colors.white),
+            ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 0), (-1, -1), 8),
+            ("GRID",          (0, 0), (-1, -1), 0.3, colors.grey),
+            ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, LIGHT_GRAY]),
+            ("ALIGN",         (1, 0), (1, -1), "CENTER"),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(st)
+    else:
+        story.append(Paragraph("No SOLID violations detected.", styles["body"]))
+
     return story
 
 
@@ -392,4 +507,8 @@ def _build_styles() -> dict:
         "code":           s("code",          fontName="Courier", fontSize=8, textColor=DARK_GRAY,
                              backColor=LIGHT_GRAY, leftIndent=6, rightIndent=6, spaceBefore=4, spaceAfter=4, leading=12),
         "table_cell_small": s("tcs",         fontSize=8,  textColor=DARK_GRAY, leading=10),
+        "bullet":           s("bullet",       fontSize=9,  textColor=DARK_GRAY,
+                             leftIndent=14, spaceAfter=3, leading=13),
+        "numbered":         s("numbered",     fontSize=9,  textColor=DARK_GRAY,
+                             leftIndent=14, spaceAfter=3, leading=13),
     }

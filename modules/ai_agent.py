@@ -1,269 +1,227 @@
 """
 modules/ai_agent.py
-Sends worst-offending files/metrics to AI models (Groq or Gemini)
-and gets back structured refactoring suggestions.
+Sends worst-offending files/metrics to AI models and gets refactoring suggestions.
+
+Provider fallback chain (automatic):
+  1. Groq (llama3-70b-8192)   — primary, free, fast
+  2. Gemini Flash              — fallback if Groq token expired/rate-limited
+  3. Skip with warning         — if both fail
+
+Pass --ai-provider groq|gemini|auto (default: auto)
+Pass --groq-key and/or --gemini-key
 """
 
-
 import json
+import time
 import urllib.request
 import urllib.error
 
+GROQ_API_URL   = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL     = "llama3-70b-8192"
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama3-70b-8192"   # Free, fast, great for code
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
 
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
-
-# How many worst files to send for AI review
 MAX_FILES_TO_REVIEW = 5
 
+# Errors that mean the token/quota is exhausted — trigger fallback
+QUOTA_ERRORS = {429, 401, 403}
 
-def get_refactoring_suggestions(metrics: dict, model: str, api_key: str) -> dict:
+
+def get_refactoring_suggestions(
+    metrics: dict,
+    groq_key: str = None,
+    gemini_key: str = None,
+    provider: str = "auto",       # "auto" | "groq" | "gemini"
+) -> dict:
     """
-    Pick the worst offending files and get AI refactoring suggestions.
+    Pick worst-offending files and get AI refactoring suggestions.
+    Automatically falls back from Groq → Gemini on token expiry.
     Returns dict: { filename: suggestion_text }
     """
     worst_files = _pick_worst_files(metrics)
-
     if not worst_files:
         print("    No significant smells found — skipping AI suggestions.")
+        return {}
+
+    # Resolve provider order
+    if provider == "groq":
+        providers = [("groq", groq_key)]
+    elif provider == "gemini":
+        providers = [("gemini", gemini_key)]
+    else:  # auto
+        providers = []
+        if groq_key:
+            providers.append(("groq", groq_key))
+        if gemini_key:
+            providers.append(("gemini", gemini_key))
+
+    if not providers:
+        print("    [WARNING] No AI API key provided. Skipping AI suggestions.")
+        print("              Set GROQ_API_KEY or GEMINI_API_KEY environment variable.")
         return {}
 
     suggestions = {}
     for filename, smells in worst_files.items():
         print(f"    Analyzing: {filename}")
-        if model == "groq":
-            suggestion = _query_groq(filename, smells, metrics, api_key)
-        elif model == "gemini":
-            suggestion = _query_gemini(filename, smells, metrics, api_key)
-        else:
-            print(f"    Unsupported model: {model}")
-            suggestion = None
-        if suggestion:
-            suggestions[filename] = suggestion
+        result = _query_with_fallback(filename, smells, metrics, providers)
+        if result:
+            suggestions[filename] = result
 
     return suggestions
+
+
+# ─── Fallback Chain ───────────────────────────────────────────────────────────
+
+def _query_with_fallback(filename, smells, metrics, providers):
+    """Try each provider in order; fall back on quota/auth errors."""
+    for name, key in providers:
+        if not key:
+            continue
+        print(f"      → Trying {name}...")
+        result, should_fallback = _query_provider(name, key, filename, smells, metrics)
+        if result:
+            return result
+        if should_fallback:
+            print(f"      → {name} quota/token expired. Trying next provider...")
+            continue
+        else:
+            # Non-quota error — don't retry
+            break
+    print(f"      [WARNING] All AI providers failed for {filename}. Skipping.")
+    return None
+
+
+def _query_provider(name, key, filename, smells, metrics):
+    """
+    Returns (result_text, should_fallback).
+    should_fallback=True means quota/auth issue → try next provider.
+    """
+    prompt = _build_prompt(filename, smells, metrics)
+    try:
+        if name == "groq":
+            return _query_groq(prompt, key), False
+        elif name == "gemini":
+            return _query_gemini(prompt, key), False
+    except _QuotaError as e:
+        print(f"      [QUOTA] {name}: {e}")
+        return None, True
+    except Exception as e:
+        print(f"      [ERROR] {name}: {e}")
+        return None, False
+    return None, False
+
+
+class _QuotaError(Exception):
+    pass
+
+
+# ─── Prompt Builder ───────────────────────────────────────────────────────────
+
+def _build_prompt(filename, smells, metrics):
+    smell_descriptions = "\n".join(
+        f"  - [{s['severity'].upper()}] {s['type']}: {s['detail']}" for s in smells
+    )
+    file_data  = metrics.get("files", {}).get(filename, {})
+    ck         = metrics.get("ck_metrics", {}).get(filename, {})
+    func_count = len(file_data.get("functions", []))
+
+    ck_summary = "\n".join(
+        f"  - {k}: {v}" for k, v in ck.items() if k != "functions"
+    )
+
+    return f"""You are an expert C++ software engineer specializing in Object-Oriented design, refactoring, and code quality analysis.
+
+Analyze the following code smell report for a C++ file and provide a comprehensive refactoring plan.
+
+FILE: {filename}
+
+CK METRICS:
+{ck_summary}
+  - Number of functions: {func_count}
+
+DETECTED SMELLS (mapped to SOLID principles):
+{smell_descriptions}
+
+Provide a detailed analysis in the following structure:
+
+### 1. Problem Summary
+Briefly summarize the main design issues.
+
+### 2. Violated SOLID Principles
+List which SOLID principles (S/O/L/I/D) are violated and why.
+
+### 3. Root Cause Analysis
+Explain why these issues exist.
+
+### 4. Refactoring Strategy
+High-level approach (e.g., Extract Class, Strategy Pattern, DIP via interfaces).
+
+### 5. Step-by-Step Refactoring Plan
+Detailed actionable steps with C++ code snippets where helpful.
+
+### 6. Expected Metric Improvements
+State expected improvements in WMC, CBO, CCN, LCOM after refactoring.
+
+### 7. Potential Risks
+Mention risks in implementing these changes.
+
+Format response strictly as Markdown."""
+
+
+# ─── Groq ────────────────────────────────────────────────────────────────────
+
+def _query_groq(prompt: str, api_key: str) -> str:
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a C++ OO design expert. Give precise, actionable refactoring advice mapped to SOLID principles."},
+            {"role": "user",   "content": prompt},
+        ],
+        "max_tokens": 2048,
+        "temperature": 0.3,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req  = urllib.request.Request(
+        GROQ_API_URL, data=data,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        if e.code in QUOTA_ERRORS:
+            raise _QuotaError(f"HTTP {e.code}: {body[:120]}")
+        raise Exception(f"Groq HTTP {e.code}: {body[:120]}")
+
+
+# ─── Gemini ──────────────────────────────────────────────────────────────────
+
+def _query_gemini(prompt: str, api_key: str) -> str:
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    data    = json.dumps(payload).encode("utf-8")
+    url     = f"{GEMINI_API_URL}?key={api_key}"
+    req     = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result["candidates"][0]["content"]["parts"][0]["text"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        if e.code in QUOTA_ERRORS:
+            raise _QuotaError(f"HTTP {e.code}: {body[:120]}")
+        raise Exception(f"Gemini HTTP {e.code}: {body[:120]}")
 
 
 # ─── File Selection ───────────────────────────────────────────────────────────
 
 def _pick_worst_files(metrics: dict) -> dict:
-    """Pick files with the most/worst smells for AI review."""
-    smell_counts = {
-        filename: len(smells)
-        for filename, smells in metrics.get("smells", {}).items()
-    }
-
-    # Sort by smell count descending, take top N
+    smell_counts = {f: len(s) for f, s in metrics.get("smells", {}).items()}
     sorted_files = sorted(smell_counts.items(), key=lambda x: x[1], reverse=True)
-    top_files = dict(sorted_files[:MAX_FILES_TO_REVIEW])
-
-    result = {}
-    for filename in top_files:
-        result[filename] = metrics["smells"][filename]
-
-    return result
-
-
-# ─── Groq API Call ────────────────────────────────────────────────────────────
-
-def _query_groq(filename: str, smells: list, metrics: dict, api_key: str) -> str:
-    """Send file smells to Groq and return refactoring suggestion."""
-
-    # Build the prompt
-    smell_descriptions = "\n".join(
-        f"  - [{s['severity'].upper()}] {s['type']}: {s['detail']}"
-        for s in smells
-    )
-
-    # Get file metrics if available
-    file_data = metrics.get("files", {}).get(filename, {})
-    func_count = len(file_data.get("functions", []))
-    total_lines = file_data.get("total_nloc", "unknown")
-    max_ccn = file_data.get("max_ccn", "unknown")
-
-    prompt = f"""You are an expert C++ software engineer specializing in Object-Oriented design, refactoring, and code quality analysis.
-
-Analyze the following code smell report for a C++ file and provide a comprehensive refactoring plan.
-
-FILE: {filename}
-METRICS:
-  - Total lines of code: {total_lines}
-  - Number of functions: {func_count}
-  - Max cyclomatic complexity: {max_ccn}
-
-DETECTED SMELLS:
-{smell_descriptions}
-
-Provide a detailed analysis and refactoring plan in the following structure:
-
-### 1. Problem Summary
-Briefly summarize the main issues identified from the smells and metrics.
-
-### 2. Violated OO Principles
-List the SOLID principles and other OO design principles that are violated, with specific explanations.
-
-### 3. Root Cause Analysis
-Explain why these issues exist (e.g., feature creep, tight coupling, lack of abstraction).
-
-### 4. Refactoring Strategy
-Outline the high-level approach to fix the issues (e.g., Extract Class, Introduce Strategy Pattern).
-
-### 5. Step-by-Step Refactoring Plan
-Provide detailed, actionable steps with:
-- Specific C++ code changes
-- New class/method signatures
-- Dependency injections or interfaces to introduce
-- Code snippets where helpful
-
-### 6. Expected Benefits
-Describe the improvements in:
-- Code metrics (e.g., reduced complexity, smaller classes)
-- Maintainability, testability, and extensibility
-- Performance implications if any
-
-### 7. Potential Risks
-Mention any risks or challenges in implementing these changes.
-
-Format your response strictly as Markdown. Use blank lines between sections and paragraphs. Use ### for section headings, - for bullet points, **bold** for emphasis, `code` for code references, and ``` for code blocks. Do not merge section headings with paragraph text. Each numbered heading must start on its own line with a blank line before it. Be specific, practical, and provide concrete C++ examples where relevant."""
-
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a C++ software engineering expert. Give precise, actionable refactoring advice."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "max_tokens": 2048,
-        "temperature": 0.3,
-    }
-
-    try:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            GROQ_API_URL,
-            data=data,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-
-        with urllib.request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            return result["choices"][0]["message"]["content"]
-
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8")
-        print(f"    [ERROR] Groq API error {e.code}: {error_body}")
-        return None
-    except Exception as e:
-        print(f"    [ERROR] AI request failed: {e}")
-        return None
-
-
-# ─── Gemini API Call ──────────────────────────────────────────────────────────
-
-def _query_gemini(filename: str, smells: list, metrics: dict, api_key: str) -> str:
-    """Send file smells to Gemini and return refactoring suggestion."""
-
-    # Build the prompt (same as Groq)
-    smell_descriptions = "\n".join(
-        f"  - [{s['severity'].upper()}] {s['type']}: {s['detail']}"
-        for s in smells
-    )
-
-    # Get file metrics if available
-    file_data = metrics.get("files", {}).get(filename, {})
-    func_count = len(file_data.get("functions", []))
-    total_lines = file_data.get("total_nloc", "unknown")
-    max_ccn = file_data.get("max_ccn", "unknown")
-
-    prompt = f"""You are an expert C++ software engineer specializing in Object-Oriented design, refactoring, and code quality analysis.
-
-Analyze the following code smell report for a C++ file and provide a comprehensive refactoring plan.
-
-FILE: {filename}
-METRICS:
-  - Total lines of code: {total_lines}
-  - Number of functions: {func_count}
-  - Max cyclomatic complexity: {max_ccn}
-
-DETECTED SMELLS:
-{smell_descriptions}
-
-Provide a detailed analysis and refactoring plan in the following structure:
-
-### 1. Problem Summary
-Briefly summarize the main issues identified from the smells and metrics.
-
-### 2. Violated OO Principles
-List the SOLID principles and other OO design principles that are violated, with specific explanations.
-
-### 3. Root Cause Analysis
-Explain why these issues exist (e.g., feature creep, tight coupling, lack of abstraction).
-
-### 4. Refactoring Strategy
-Outline the high-level approach to fix the issues (e.g., Extract Class, Introduce Strategy Pattern).
-
-### 5. Step-by-Step Refactoring Plan
-Provide detailed, actionable steps with:
-- Specific C++ code changes
-- New class/method signatures
-- Dependency injections or interfaces to introduce
-- Code snippets where helpful
-
-### 6. Expected Benefits
-Describe the improvements in:
-- Code metrics (e.g., reduced complexity, smaller classes)
-- Maintainability, testability, and extensibility
-- Performance implications if any
-
-### 7. Potential Risks
-Mention any risks or challenges in implementing these changes.
-
-Format your response strictly as Markdown. Use blank lines between sections and paragraphs. Use ### for section headings, - for bullet points, **bold** for emphasis, `code` for code references, and ``` for code blocks. Do not merge section headings with paragraph text. Each numbered heading must start on its own line with a blank line before it. Be specific, practical, and provide concrete C++ examples where relevant."""
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
-    }
-
-    try:
-        url = f"{GEMINI_API_URL}?key={api_key}"
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-
-        with urllib.request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            return result["candidates"][0]["content"]["parts"][0]["text"]
-
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8")
-        print(f"    [ERROR] Gemini API error {e.code}: {error_body}")
-        return None
-    except Exception as e:
-        print(f"    [ERROR] AI request failed: {e}")
-        return None
-
+    return {f: metrics["smells"][f] for f, _ in sorted_files[:MAX_FILES_TO_REVIEW]}
